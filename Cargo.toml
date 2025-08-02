@@ -1,0 +1,15 @@
+[package]
+name = "rsrs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.27"
+egui = "0.27"
+pnet = "0.34"
+
+[target.'cfg(windows)'.dependencies]
+# Windows-specific dependencies if needed
+
+[target.'cfg(unix)'.dependencies]
+# Unix/macOS-specific dependencies if needed
