@@ -329,33 +329,34 @@ fn send_rs_packet(interface: &AppNetworkInterface, include_slla: bool) -> Result
     let dest_ip = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
     ipv6_packet.set_destination(dest_ip);
 
-    // Create ICMPv6 Router Solicitation with options
+    // Create ICMPv6 packet manually in a buffer
     let mut icmpv6_buffer = vec![0u8; total_icmpv6_size];
-    let mut icmpv6_packet = MutableIcmpv6Packet::new(&mut icmpv6_buffer)
-        .ok_or("Failed to create ICMPv6 packet")?;
-
-    icmpv6_packet.set_icmpv6_type(Icmpv6Types::RouterSolicit);
-    icmpv6_packet.set_icmpv6_code(Icmpv6Code(0));
+    
+    // Set basic ICMPv6 Router Solicitation header
+    icmpv6_buffer[0] = 133; // Type: Router Solicitation
+    icmpv6_buffer[1] = 0;   // Code: 0
+    icmpv6_buffer[2] = 0;   // Checksum: will be calculated later
+    icmpv6_buffer[3] = 0;   // Checksum
+    // Bytes 4-7 are reserved (already zero)
     
     // Add Source Link-layer Address option if requested
     if include_slla {
-        let payload = icmpv6_packet.payload_mut();
-        // First 4 bytes are reserved (already zeroed)
+        icmpv6_buffer[8] = 1;  // Option Type: Source Link-layer Address
+        icmpv6_buffer[9] = 1;  // Option Length: 1 (8 bytes)
         
-        // Add Source Link-layer Address option at offset 4
-        payload[4] = 1;  // Option Type: Source Link-layer Address
-        payload[5] = 1;  // Option Length: 1 (8 bytes)
-        
-        // Copy MAC address (6 bytes) starting at offset 6
+        // Copy MAC address (6 bytes) starting at offset 10
         let mac_bytes = [
-            (source_mac.0), (source_mac.1), (source_mac.2),
-            (source_mac.3), (source_mac.4), (source_mac.5)
+            source_mac.0, source_mac.1, source_mac.2,
+            source_mac.3, source_mac.4, source_mac.5
         ];
-        payload[6..12].copy_from_slice(&mac_bytes);
-        // Bytes 12-13 are padding (already zeroed)
+        icmpv6_buffer[10..16].copy_from_slice(&mac_bytes);
+        // Bytes 16-17 are padding (already zeroed)
     }
+
+    // Calculate and set ICMPv6 checksum
+    let mut icmpv6_packet = MutableIcmpv6Packet::new(&mut icmpv6_buffer)
+        .ok_or("Failed to create ICMPv6 packet from buffer")?;
     
-    // Calculate checksum
     let checksum = pnet::packet::icmpv6::checksum(&icmpv6_packet.to_immutable(), &source_ip, &dest_ip);
     icmpv6_packet.set_checksum(checksum);
 
