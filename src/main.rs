@@ -11,7 +11,7 @@ use pnet::packet::ipv6::MutableIpv6Packet;
 #[cfg(unix)]
 use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
 #[cfg(unix)]
-use pnet::packet::Packet;
+use pnet::packet::{Packet, MutablePacket};
 #[cfg(unix)]
 use pnet::util::MacAddr;
 #[cfg(unix)]
@@ -52,6 +52,7 @@ struct RouterSolicitationApp {
     selected_interface: Option<usize>,
     status_message: String,
     message_receiver: Option<mpsc::Receiver<String>>,
+    include_source_link_addr: bool,
 }
 
 impl RouterSolicitationApp {
@@ -66,6 +67,7 @@ impl RouterSolicitationApp {
             selected_interface: None,
             status_message: "Ready".to_string(),
             message_receiver: None,
+            include_source_link_addr: false,
         }
     }
 
@@ -76,8 +78,9 @@ impl RouterSolicitationApp {
                 self.message_receiver = Some(rx);
                 
                 let interface_clone = interface.clone();
+                let include_slla = self.include_source_link_addr;
                 thread::spawn(move || {
-                    match send_rs_packet(&interface_clone) {
+                    match send_rs_packet(&interface_clone, include_slla) {
                         Ok(_) => {
                             let _ = tx.send("Router Solicitation sent successfully!".to_string());
                         }
@@ -139,6 +142,10 @@ impl eframe::App for RouterSolicitationApp {
                         }
                     });
             });
+
+            ui.separator();
+
+            ui.checkbox(&mut self.include_source_link_addr, "Include Source Link-layer Address option");
 
             ui.separator();
 
@@ -265,7 +272,7 @@ fn get_network_interfaces() -> Vec<AppNetworkInterface> {
 }
 
 #[cfg(unix)]
-fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::error::Error>> {
+fn send_rs_packet(interface: &AppNetworkInterface, include_slla: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Find the pnet interface by name
     let pnet_interface = datalink::interfaces()
         .into_iter()
@@ -285,8 +292,14 @@ fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::er
     // Use IPv6 multicast MAC for all routers (33:33:00:00:00:02)
     let dest_mac = MacAddr::new(0x33, 0x33, 0x00, 0x00, 0x00, 0x02);
 
+    // Calculate packet sizes
+    let icmpv6_base_size = 8; // Basic RS header
+    let slla_option_size = if include_slla { 8 } else { 0 }; // Source Link-layer Address option
+    let total_icmpv6_size = icmpv6_base_size + slla_option_size;
+    let total_packet_size = 14 + 40 + total_icmpv6_size; // Ethernet + IPv6 + ICMPv6
+
     // Create Router Solicitation packet
-    let mut ethernet_buffer = [0u8; 86]; // Ethernet header + IPv6 header + ICMPv6 RS
+    let mut ethernet_buffer = vec![0u8; total_packet_size];
     let mut ethernet_packet = MutableEthernetPacket::new(&mut ethernet_buffer)
         .ok_or("Failed to create Ethernet packet")?;
 
@@ -296,7 +309,7 @@ fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::er
     ethernet_packet.set_ethertype(EtherTypes::Ipv6);
 
     // Create IPv6 packet
-    let mut ipv6_buffer = [0u8; 48]; // IPv6 header + ICMPv6 RS
+    let mut ipv6_buffer = vec![0u8; 40 + total_icmpv6_size];
     let mut ipv6_packet = MutableIpv6Packet::new(&mut ipv6_buffer)
         .ok_or("Failed to create IPv6 packet")?;
 
@@ -304,7 +317,7 @@ fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::er
     ipv6_packet.set_version(6);
     ipv6_packet.set_traffic_class(0);
     ipv6_packet.set_flow_label(0);
-    ipv6_packet.set_payload_length(8); // ICMPv6 header size
+    ipv6_packet.set_payload_length(total_icmpv6_size as u16);
     ipv6_packet.set_next_header(pnet::packet::ip::IpNextHeaderProtocols::Icmpv6);
     ipv6_packet.set_hop_limit(255);
     
@@ -316,13 +329,31 @@ fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::er
     let dest_ip = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
     ipv6_packet.set_destination(dest_ip);
 
-    // Create ICMPv6 Router Solicitation
-    let mut icmpv6_buffer = [0u8; 8];
+    // Create ICMPv6 Router Solicitation with options
+    let mut icmpv6_buffer = vec![0u8; total_icmpv6_size];
     let mut icmpv6_packet = MutableIcmpv6Packet::new(&mut icmpv6_buffer)
         .ok_or("Failed to create ICMPv6 packet")?;
 
     icmpv6_packet.set_icmpv6_type(Icmpv6Types::RouterSolicit);
     icmpv6_packet.set_icmpv6_code(Icmpv6Code(0));
+    
+    // Add Source Link-layer Address option if requested
+    if include_slla {
+        let payload = icmpv6_packet.payload_mut();
+        // First 4 bytes are reserved (already zeroed)
+        
+        // Add Source Link-layer Address option at offset 4
+        payload[4] = 1;  // Option Type: Source Link-layer Address
+        payload[5] = 1;  // Option Length: 1 (8 bytes)
+        
+        // Copy MAC address (6 bytes) starting at offset 6
+        let mac_bytes = [
+            (source_mac.0), (source_mac.1), (source_mac.2),
+            (source_mac.3), (source_mac.4), (source_mac.5)
+        ];
+        payload[6..12].copy_from_slice(&mac_bytes);
+        // Bytes 12-13 are padding (already zeroed)
+    }
     
     // Calculate checksum
     let checksum = pnet::packet::icmpv6::checksum(&icmpv6_packet.to_immutable(), &source_ip, &dest_ip);
@@ -343,7 +374,7 @@ fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::er
 }
 
 #[cfg(windows)]
-fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::error::Error>> {
+fn send_rs_packet(interface: &AppNetworkInterface, include_slla: bool) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         // Initialize Winsock
         let mut wsa_data: WSADATA = mem::zeroed();
@@ -352,48 +383,47 @@ fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::er
             return Err(format!("WSAStartup failed: {}", result).into());
         }
 
-        // Create raw ICMPv6 socket (back to the working approach)
+        // Create raw ICMPv6 socket
         let socket = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
         if socket == INVALID_SOCKET {
             WSACleanup();
             return Err("Failed to create raw socket".into());
         }
 
-        // Try to bind to unspecified address to influence source selection
-        let mut bind_addr: SOCKADDR_IN6 = mem::zeroed();
-        bind_addr.sin6_family = AF_INET6 as u16;
-        bind_addr.sin6_port = 0;
-        bind_addr.sin6_flowinfo = 0;
-        // Leave sin6_addr as all zeros (unspecified address)
-        let scope_ptr = &mut bind_addr.u as *mut _ as *mut u32;
-        *scope_ptr = interface.index;
+        // Calculate packet size
+        let base_size = 8; // Basic RS header (4 bytes) + reserved (4 bytes)
+        let slla_option_size = if include_slla { 8 } else { 0 };
+        let total_size = base_size + slla_option_size;
 
-        let bind_result = bind(
-            socket,
-            &bind_addr as *const _ as *const SOCKADDR,
-            mem::size_of::<SOCKADDR_IN6>() as i32,
-        );
+        // Create Router Solicitation packet with optional Source Link-layer Address
+        let mut packet = vec![0u8; total_size];
+        
+        // ICMPv6 header
+        packet[0] = 133; // Router Solicitation type
+        packet[1] = 0;   // Code
+        packet[2] = 0;   // Checksum (kernel will calculate)
+        packet[3] = 0;   // Checksum
+        // Bytes 4-7 are reserved (already zero)
 
-        // Continue even if bind fails - it might not be supported
-        if bind_result != 0 {
-            // Binding failed, but continue anyway
+        // Add Source Link-layer Address option if requested
+        if include_slla {
+            // Parse MAC address from interface
+            if let Some(mac_str) = &interface.mac {
+                let mac_parts: Vec<&str> = mac_str.split(':').collect();
+                if mac_parts.len() == 6 {
+                    packet[8] = 1;  // Option Type: Source Link-layer Address
+                    packet[9] = 1;  // Option Length: 1 (8 bytes)
+                    
+                    // Parse and copy MAC address
+                    for (i, part) in mac_parts.iter().enumerate() {
+                        if let Ok(byte) = u8::from_str_radix(part, 16) {
+                            packet[10 + i] = byte;
+                        }
+                    }
+                    // Bytes 16-17 would be padding if needed (already zero)
+                }
+            }
         }
-
-        // Create Router Solicitation packet (ICMPv6 only)
-        #[repr(C, packed)]
-        struct Icmpv6RouterSolicitation {
-            icmp_type: u8,     // 133
-            icmp_code: u8,     // 0
-            icmp_checksum: u16, // Will be calculated by kernel
-            reserved: u32,     // Must be 0
-        }
-
-        let rs_packet = Icmpv6RouterSolicitation {
-            icmp_type: 133,    // Router Solicitation
-            icmp_code: 0,
-            icmp_checksum: 0,  // Kernel will calculate
-            reserved: 0,
-        };
 
         // Destination address: ff02::2 (All Routers multicast)
         let mut dest_addr: SOCKADDR_IN6 = mem::zeroed();
@@ -412,15 +442,10 @@ fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::er
         *scope_ptr = interface.index;
 
         // Send the packet
-        let packet_bytes = std::slice::from_raw_parts(
-            &rs_packet as *const _ as *const u8,
-            mem::size_of::<Icmpv6RouterSolicitation>()
-        );
-
         let result = sendto(
             socket,
-            packet_bytes.as_ptr() as *const i8,
-            packet_bytes.len() as i32,
+            packet.as_ptr() as *const i8,
+            packet.len() as i32,
             0,
             &dest_addr as *const _ as *const SOCKADDR,
             mem::size_of::<SOCKADDR_IN6>() as i32,
