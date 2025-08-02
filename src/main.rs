@@ -22,7 +22,7 @@ use windows::Win32::NetworkManagement::IpHelper::*;
 #[cfg(windows)]
 use winapi::um::winsock2::{
     WSAStartup, WSACleanup, WSAGetLastError, WSADATA, INVALID_SOCKET, SOCKET_ERROR,
-    socket, sendto, closesocket, setsockopt, SOL_SOCKET, SO_REUSEADDR
+    socket, sendto, closesocket, setsockopt, SOL_SOCKET
 };
 #[cfg(windows)]
 use winapi::shared::ws2def::{SOCK_RAW, AF_INET6, SOCKADDR};
@@ -33,9 +33,11 @@ use std::mem;
 
 // Define protocol numbers
 #[cfg(windows)]
-const IPPROTO_IPV6: i32 = 41;
+const IPPROTO_RAW: i32 = 255;  // Raw IP packets
 #[cfg(windows)]
 const IPPROTO_ICMPV6: u8 = 58;
+#[cfg(windows)]
+const IPV6_HDRINCL: i32 = 2;
 
 // Cross-platform network interface representation
 #[derive(Clone)]
@@ -354,11 +356,26 @@ fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::er
             return Err(format!("WSAStartup failed: {}", result).into());
         }
 
-        // Create raw IPv6 socket
-        let socket = socket(AF_INET6, SOCK_RAW, IPPROTO_IPV6);
+        // Create raw socket with IPPROTO_RAW to prevent double headers
+        let socket = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW);
         if socket == INVALID_SOCKET {
             WSACleanup();
             return Err("Failed to create raw socket".into());
+        }
+
+        // Enable IP header inclusion to prevent automatic header addition
+        let hdrincl: i32 = 1;
+        let result = setsockopt(
+            socket,
+            41, // IPPROTO_IPV6
+            IPV6_HDRINCL,
+            &hdrincl as *const _ as *const i8,
+            mem::size_of::<i32>() as i32,
+        );
+        if result != 0 {
+            closesocket(socket);
+            WSACleanup();
+            return Err("Failed to set IPV6_HDRINCL".into());
         }
 
         // Create the complete IPv6 + ICMPv6 packet
