@@ -22,7 +22,7 @@ use windows::Win32::NetworkManagement::IpHelper::*;
 #[cfg(windows)]
 use winapi::um::winsock2::{
     WSAStartup, WSACleanup, WSAGetLastError, WSADATA, INVALID_SOCKET, SOCKET_ERROR,
-    socket, sendto, closesocket
+    socket, sendto, closesocket, setsockopt, SOL_SOCKET, SO_REUSEADDR
 };
 #[cfg(windows)]
 use winapi::shared::ws2def::{SOCK_RAW, AF_INET6, SOCKADDR};
@@ -31,9 +31,11 @@ use winapi::shared::ws2ipdef::SOCKADDR_IN6;
 #[cfg(windows)]
 use std::mem;
 
-// Define ICMPv6 protocol number since it's not in winapi
+// Define protocol numbers
 #[cfg(windows)]
-const IPPROTO_ICMPV6: i32 = 58;
+const IPPROTO_IPV6: i32 = 41;
+#[cfg(windows)]
+const IPPROTO_ICMPV6: u8 = 58;
 
 // Cross-platform network interface representation
 #[derive(Clone)]
@@ -352,50 +354,91 @@ fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::er
             return Err(format!("WSAStartup failed: {}", result).into());
         }
 
-        // Create raw ICMPv6 socket
-        let socket = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+        // Create raw IPv6 socket
+        let socket = socket(AF_INET6, SOCK_RAW, IPPROTO_IPV6);
         if socket == INVALID_SOCKET {
             WSACleanup();
             return Err("Failed to create raw socket".into());
         }
 
-        // Create Router Solicitation packet (ICMPv6)
+        // Create the complete IPv6 + ICMPv6 packet
+        #[repr(C, packed)]
+        struct Ipv6Header {
+            version_class_label: u32, // Version(4) + Traffic Class(8) + Flow Label(20)
+            payload_length: u16,
+            next_header: u8,
+            hop_limit: u8,
+            source_addr: [u8; 16],
+            dest_addr: [u8; 16],
+        }
+
         #[repr(C, packed)]
         struct Icmpv6RouterSolicitation {
             icmp_type: u8,     // 133
             icmp_code: u8,     // 0
-            icmp_checksum: u16, // Will be calculated by kernel
+            icmp_checksum: u16, // Will be calculated
             reserved: u32,     // Must be 0
         }
 
-        let rs_packet = Icmpv6RouterSolicitation {
+        #[repr(C, packed)]
+        struct Ipv6Packet {
+            ipv6_header: Ipv6Header,
+            icmpv6_data: Icmpv6RouterSolicitation,
+        }
+
+        // Create IPv6 header
+        let ipv6_header = Ipv6Header {
+            version_class_label: (6u32 << 28).to_be(), // Version 6, Traffic Class 0, Flow Label 0
+            payload_length: (mem::size_of::<Icmpv6RouterSolicitation>() as u16).to_be(),
+            next_header: IPPROTO_ICMPV6,
+            hop_limit: 255,
+            source_addr: [0; 16], // Unspecified address (::)
+            dest_addr: [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02], // ff02::2
+        };
+
+        // Create ICMPv6 Router Solicitation
+        let mut icmpv6_data = Icmpv6RouterSolicitation {
             icmp_type: 133,    // Router Solicitation
             icmp_code: 0,
-            icmp_checksum: 0,  // Kernel will calculate
+            icmp_checksum: 0,  // Will calculate below
             reserved: 0,
         };
 
-        // Destination address: ff02::2 (All Routers multicast)
+        // Calculate ICMPv6 checksum
+        let checksum = calculate_icmpv6_checksum(
+            &ipv6_header.source_addr,
+            &ipv6_header.dest_addr,
+            &icmpv6_data as *const _ as *const u8,
+            mem::size_of::<Icmpv6RouterSolicitation>()
+        );
+        icmpv6_data.icmp_checksum = checksum.to_be();
+
+        // Create complete packet
+        let packet = Ipv6Packet {
+            ipv6_header,
+            icmpv6_data,
+        };
+
+        // Destination address for sendto (just the IPv6 address part)
         let mut dest_addr: SOCKADDR_IN6 = mem::zeroed();
         dest_addr.sin6_family = AF_INET6 as u16;
         dest_addr.sin6_port = 0;
         dest_addr.sin6_flowinfo = 0;
         
-        // Set IPv6 address to ff02::2 by directly writing to the address bytes
-        // Use transmute to access the raw bytes of the address
+        // Set IPv6 address to ff02::2
         let addr_ptr = &mut dest_addr.sin6_addr as *mut _ as *mut [u8; 16];
         (*addr_ptr)[0] = 0xff;
         (*addr_ptr)[1] = 0x02;
         (*addr_ptr)[15] = 0x02;
         
-        // Set scope ID for interface binding - accessing through the union
+        // Set scope ID for interface binding
         let scope_ptr = &mut dest_addr.u as *mut _ as *mut u32;
         *scope_ptr = interface.index;
 
         // Send the packet
         let packet_bytes = std::slice::from_raw_parts(
-            &rs_packet as *const _ as *const u8,
-            mem::size_of::<Icmpv6RouterSolicitation>()
+            &packet as *const _ as *const u8,
+            mem::size_of::<Ipv6Packet>()
         );
 
         let result = sendto(
@@ -417,6 +460,50 @@ fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::er
     }
     
     Ok(())
+}
+
+#[cfg(windows)]
+unsafe fn calculate_icmpv6_checksum(
+    src_addr: &[u8; 16],
+    dst_addr: &[u8; 16], 
+    icmp_data: *const u8,
+    icmp_len: usize
+) -> u16 {
+    let mut sum: u32 = 0;
+    
+    // Add source address
+    for i in (0..16).step_by(2) {
+        sum += ((src_addr[i] as u32) << 8) + (src_addr[i + 1] as u32);
+    }
+    
+    // Add destination address  
+    for i in (0..16).step_by(2) {
+        sum += ((dst_addr[i] as u32) << 8) + (dst_addr[i + 1] as u32);
+    }
+    
+    // Add upper-layer packet length
+    sum += icmp_len as u32;
+    
+    // Add next header (ICMPv6 = 58)
+    sum += IPPROTO_ICMPV6 as u32;
+    
+    // Add ICMPv6 header and data
+    let data_slice = std::slice::from_raw_parts(icmp_data, icmp_len);
+    for i in (0..icmp_len).step_by(2) {
+        if i + 1 < icmp_len {
+            sum += ((data_slice[i] as u32) << 8) + (data_slice[i + 1] as u32);
+        } else {
+            sum += (data_slice[i] as u32) << 8;
+        }
+    }
+    
+    // Fold to 16 bits
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    
+    // One's complement
+    (!sum) as u16
 }
 
 fn main() -> Result<(), eframe::Error> {
