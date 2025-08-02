@@ -151,7 +151,7 @@ impl eframe::App for RouterSolicitationApp {
         self.check_for_messages();
         
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("IPv6 Router Solicitation Tool");
+            ui.heading("RSRS - Router Solicitation/Advertisement Tool");
             ui.separator();
 
             ui.horizontal(|ui| {
@@ -776,12 +776,12 @@ fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([480.0, 400.0])
-            .with_title("IPv6 Router Solicitation Tool"),
+            .with_title("RSRS - Router Solicitation/Advertisement Tool"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "IPv6 Router Solicitation Tool",
+        "RSRS - Router Solicitation/Advertisement Tool",
         options,
         Box::new(|cc| Box::new(RouterSolicitationApp::new(cc))),
     )
