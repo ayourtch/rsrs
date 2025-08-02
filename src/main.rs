@@ -37,7 +37,7 @@ const IPPROTO_ICMPV6: i32 = 58;
 #[cfg(windows)]
 const IPPROTO_IPV6: i32 = 41;
 #[cfg(windows)]
-const IPV6_UNICAST_HOPS: i32 = 4;
+const IPV6_MULTICAST_HOPS: i32 = 10;
 
 // Cross-platform network interface representation
 #[derive(Clone)]
@@ -395,19 +395,19 @@ fn send_rs_packet(interface: &AppNetworkInterface, include_slla: bool) -> Result
             return Err("Failed to create raw socket".into());
         }
 
-        // Set hop limit to 255 (required by RFC 4861)
+        // Set multicast hop limit to 255 (required by RFC 4861 for ff02::2)
         let hop_limit: i32 = 255;
         let result = setsockopt(
             socket,
             IPPROTO_IPV6,
-            IPV6_UNICAST_HOPS,
+            IPV6_MULTICAST_HOPS,
             &hop_limit as *const _ as *const i8,
             mem::size_of::<i32>() as i32,
         );
         if result != 0 {
             closesocket(socket);
             WSACleanup();
-            return Err("Failed to set hop limit to 255".into());
+            return Err("Failed to set multicast hop limit to 255".into());
         }
 
         // Calculate packet size
