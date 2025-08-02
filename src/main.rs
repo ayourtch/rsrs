@@ -31,9 +31,13 @@ use winapi::shared::ws2ipdef::SOCKADDR_IN6;
 #[cfg(windows)]
 use std::mem;
 
-// Define protocol number
+// Define protocol numbers and socket options
 #[cfg(windows)]
 const IPPROTO_ICMPV6: i32 = 58;
+#[cfg(windows)]
+const IPPROTO_IPV6: i32 = 41;
+#[cfg(windows)]
+const IPV6_UNICAST_HOPS: i32 = 4;
 
 // Cross-platform network interface representation
 #[derive(Clone)]
@@ -319,7 +323,7 @@ fn send_rs_packet(interface: &AppNetworkInterface, include_slla: bool) -> Result
     ipv6_packet.set_flow_label(0);
     ipv6_packet.set_payload_length(total_icmpv6_size as u16);
     ipv6_packet.set_next_header(pnet::packet::ip::IpNextHeaderProtocols::Icmpv6);
-    ipv6_packet.set_hop_limit(255);
+    ipv6_packet.set_hop_limit(255); // RFC 4861 requirement
     
     // Source: link-local address or unspecified
     let source_ip = Ipv6Addr::UNSPECIFIED;
@@ -389,6 +393,21 @@ fn send_rs_packet(interface: &AppNetworkInterface, include_slla: bool) -> Result
         if socket == INVALID_SOCKET {
             WSACleanup();
             return Err("Failed to create raw socket".into());
+        }
+
+        // Set hop limit to 255 (required by RFC 4861)
+        let hop_limit: i32 = 255;
+        let result = setsockopt(
+            socket,
+            IPPROTO_IPV6,
+            IPV6_UNICAST_HOPS,
+            &hop_limit as *const _ as *const i8,
+            mem::size_of::<i32>() as i32,
+        );
+        if result != 0 {
+            closesocket(socket);
+            WSACleanup();
+            return Err("Failed to set hop limit to 255".into());
         }
 
         // Calculate packet size
