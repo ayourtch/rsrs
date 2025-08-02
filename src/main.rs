@@ -1,17 +1,47 @@
 use eframe::egui;
-use pnet::datalink::{self, NetworkInterface};
-use pnet::packet::icmpv6::{Icmpv6Packet, Icmpv6Types, Icmpv6Code, MutableIcmpv6Packet};
-use pnet::packet::ipv6::{MutableIpv6Packet, Ipv6Packet};
-use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
-use pnet::packet::Packet;
-use pnet::util::MacAddr;
-use std::net::Ipv6Addr;
 use std::sync::mpsc;
 use std::thread;
 
+#[cfg(unix)]
+use pnet::datalink;
+#[cfg(unix)]
+use pnet::packet::icmpv6::{Icmpv6Types, Icmpv6Code, MutableIcmpv6Packet};
+#[cfg(unix)]
+use pnet::packet::ipv6::MutableIpv6Packet;
+#[cfg(unix)]
+use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
+#[cfg(unix)]
+use pnet::packet::Packet;
+#[cfg(unix)]
+use pnet::util::MacAddr;
+#[cfg(unix)]
+use std::net::Ipv6Addr;
+
+#[cfg(windows)]
+use windows::Win32::NetworkManagement::IpHelper::*;
+#[cfg(windows)]
+use windows::Win32::Networking::WinSock::*;
+#[cfg(windows)]
+use windows::Win32::Foundation::*;
+#[cfg(windows)]
+use socket2::{Socket, Domain, Type, Protocol};
+#[cfg(windows)]
+use std::net::{Ipv6Addr, SocketAddrV6};
+
+// Cross-platform network interface representation
+#[derive(Clone)]
+struct AppNetworkInterface {
+    name: String,
+    index: u32,
+    mac: Option<String>,
+    ips: Vec<String>,
+    is_up: bool,
+    is_loopback: bool,
+}
+
 #[derive(Default)]
 struct RouterSolicitationApp {
-    interfaces: Vec<NetworkInterface>,
+    interfaces: Vec<AppNetworkInterface>,
     selected_interface: Option<usize>,
     status_message: String,
     message_receiver: Option<mpsc::Receiver<String>>,
@@ -19,9 +49,9 @@ struct RouterSolicitationApp {
 
 impl RouterSolicitationApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let interfaces = datalink::interfaces()
+        let interfaces = get_network_interfaces()
             .into_iter()
-            .filter(|iface| !iface.is_loopback() && iface.is_up())
+            .filter(|iface| !iface.is_loopback && iface.is_up)
             .collect();
 
         Self {
@@ -79,7 +109,7 @@ impl eframe::App for RouterSolicitationApp {
                 let selected_text = if let Some(index) = self.selected_interface {
                     if let Some(interface) = self.interfaces.get(index) {
                         format!("{} ({})", interface.name, 
-                               interface.mac.map_or("No MAC".to_string(), |mac| mac.to_string()))
+                               interface.mac.as_deref().unwrap_or("No MAC"))
                     } else {
                         "Select interface...".to_string()
                     }
@@ -93,7 +123,7 @@ impl eframe::App for RouterSolicitationApp {
                         for (index, interface) in self.interfaces.iter().enumerate() {
                             let interface_text = format!("{} ({})", 
                                 interface.name, 
-                                interface.mac.map_or("No MAC".to_string(), |mac| mac.to_string())
+                                interface.mac.as_deref().unwrap_or("No MAC")
                             );
                             
                             if ui.selectable_value(&mut self.selected_interface, Some(index), interface_text).clicked() {
@@ -130,13 +160,8 @@ impl eframe::App for RouterSolicitationApp {
                     ui.label("Interface Details:");
                     ui.monospace(format!("Name: {}", interface.name));
                     ui.monospace(format!("Index: {}", interface.index));
-                    ui.monospace(format!("MAC: {}", interface.mac.map_or("None".to_string(), |mac| mac.to_string())));
-                    ui.monospace(format!("IPs: {}", 
-                        interface.ips.iter()
-                            .map(|ip| ip.ip().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
+                    ui.monospace(format!("MAC: {}", interface.mac.as_deref().unwrap_or("None")));
+                    ui.monospace(format!("IPs: {}", interface.ips.join(", ")));
                 }
             }
         });
@@ -146,16 +171,109 @@ impl eframe::App for RouterSolicitationApp {
     }
 }
 
-fn send_rs_packet(interface: &NetworkInterface) -> Result<(), Box<dyn std::error::Error>> {
+#[cfg(unix)]
+fn get_network_interfaces() -> Vec<AppNetworkInterface> {
+    datalink::interfaces()
+        .into_iter()
+        .map(|iface| AppNetworkInterface {
+            name: iface.name.clone(),
+            index: iface.index,
+            mac: iface.mac.map(|mac| mac.to_string()),
+            ips: iface.ips.iter().map(|ip| ip.ip().to_string()).collect(),
+            is_up: iface.is_up(),
+            is_loopback: iface.is_loopback(),
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn get_network_interfaces() -> Vec<AppNetworkInterface> {
+    let mut interfaces = Vec::new();
+    
+    unsafe {
+        let mut adapter_info: *mut IP_ADAPTER_INFO = std::ptr::null_mut();
+        let mut size = 0u32;
+        
+        // Get the size needed
+        let _ = GetAdaptersInfo(None, &mut size);
+        
+        if size > 0 {
+            let buffer = vec![0u8; size as usize];
+            adapter_info = buffer.as_ptr() as *mut IP_ADAPTER_INFO;
+            
+            if GetAdaptersInfo(Some(adapter_info), &mut size) == NO_ERROR {
+                let mut current = adapter_info;
+                
+                while !current.is_null() {
+                    let adapter = &*current;
+                    
+                    let name = std::ffi::CStr::from_ptr(adapter.AdapterName.as_ptr())
+                        .to_string_lossy()
+                        .to_string();
+                    
+                    let description = std::ffi::CStr::from_ptr(adapter.Description.as_ptr())
+                        .to_string_lossy()
+                        .to_string();
+                    
+                    let mac = if adapter.AddressLength == 6 {
+                        Some(format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                            adapter.Address[0], adapter.Address[1], adapter.Address[2],
+                            adapter.Address[3], adapter.Address[4], adapter.Address[5]))
+                    } else {
+                        None
+                    };
+                    
+                    let mut ips = Vec::new();
+                    let mut ip_list = &adapter.IpAddressList;
+                    loop {
+                        let ip_str = std::ffi::CStr::from_ptr(ip_list.IpAddress.String.as_ptr())
+                            .to_string_lossy()
+                            .to_string();
+                        if !ip_str.is_empty() && ip_str != "0.0.0.0" {
+                            ips.push(ip_str);
+                        }
+                        
+                        if ip_list.Next.is_null() {
+                            break;
+                        }
+                        ip_list = &*ip_list.Next;
+                    }
+                    
+                    interfaces.push(AppNetworkInterface {
+                        name: description,
+                        index: adapter.Index,
+                        mac,
+                        ips,
+                        is_up: true, // Assume up if we can enumerate it
+                        is_loopback: name.contains("Loopback") || name.contains("loopback"),
+                    });
+                    
+                    current = adapter.Next;
+                }
+            }
+        }
+    }
+    
+    interfaces
+}
+
+#[cfg(unix)]
+fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::error::Error>> {
+    // Find the pnet interface by name
+    let pnet_interface = datalink::interfaces()
+        .into_iter()
+        .find(|iface| iface.name == interface.name)
+        .ok_or("Interface not found")?;
+
     // Create a channel to send packets
-    let (mut tx, _rx) = match datalink::channel(interface, Default::default()) {
+    let (mut tx, _rx) = match datalink::channel(&pnet_interface, Default::default()) {
         Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => return Err("Unsupported channel type".into()),
         Err(e) => return Err(format!("Failed to create channel: {}", e).into()),
     };
 
     // Get the interface MAC address
-    let source_mac = interface.mac.ok_or("Interface has no MAC address")?;
+    let source_mac = pnet_interface.mac.ok_or("Interface has no MAC address")?;
     
     // Use IPv6 multicast MAC for all routers (33:33:00:00:00:02)
     let dest_mac = MacAddr::new(0x33, 0x33, 0x00, 0x00, 0x00, 0x02);
@@ -210,10 +328,42 @@ fn send_rs_packet(interface: &NetworkInterface) -> Result<(), Box<dyn std::error
     ethernet_packet.set_payload(ipv6_packet.packet());
 
     // Send the packet
-    tx.send_to(ethernet_packet.packet(), Some(interface.clone()))
+    tx.send_to(ethernet_packet.packet(), Some(pnet_interface))
         .ok_or("Failed to send packet")?
         .map_err(|e| format!("Send error: {}", e))?;
 
+    Ok(())
+}
+
+#[cfg(windows)]
+fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::error::Error>> {
+    // Create raw ICMPv6 socket
+    let socket = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::ICMPV6))?;
+    
+    // Create Router Solicitation packet (ICMPv6)
+    let mut packet = [0u8; 8];
+    packet[0] = 133; // ICMPv6 Router Solicitation type
+    packet[1] = 0;   // Code
+    // Checksum will be calculated by the kernel
+    packet[2] = 0;
+    packet[3] = 0;
+    // Reserved field
+    packet[4] = 0;
+    packet[5] = 0;
+    packet[6] = 0;
+    packet[7] = 0;
+
+    // Destination: all routers multicast (ff02::2)
+    let dest_addr = SocketAddrV6::new(
+        Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2),
+        0,
+        0,
+        interface.index,
+    );
+
+    // Send the packet
+    socket.send_to(&packet, &dest_addr.into())?;
+    
     Ok(())
 }
 

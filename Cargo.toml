@@ -1,15 +1,20 @@
 [package]
-name = "rsrs"
+name = "ipv6-router-solicitation"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 eframe = "0.27"
 egui = "0.27"
+
+[target.'cfg(unix)'.dependencies]
 pnet = "0.34"
 
 [target.'cfg(windows)'.dependencies]
-# Windows-specific dependencies if needed
-
-[target.'cfg(unix)'.dependencies]
-# Unix/macOS-specific dependencies if needed
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_IO",
+] }
+socket2 = "0.5"
