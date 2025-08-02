@@ -20,13 +20,20 @@ use std::net::Ipv6Addr;
 #[cfg(windows)]
 use windows::Win32::NetworkManagement::IpHelper::*;
 #[cfg(windows)]
-use windows::Win32::Networking::WinSock::*;
+use winapi::um::winsock2::{
+    WSAStartup, WSACleanup, WSAGetLastError, WSADATA, INVALID_SOCKET, SOCKET_ERROR,
+    socket, sendto, closesocket
+};
 #[cfg(windows)]
-use windows::Win32::Foundation::*;
+use winapi::shared::ws2def::{SOCK_RAW, AF_INET6, SOCKADDR};
 #[cfg(windows)]
-use socket2::{Socket, Domain, Type, Protocol};
+use winapi::shared::ws2ipdef::SOCKADDR_IN6;
 #[cfg(windows)]
-use std::net::{Ipv6Addr, SocketAddrV6};
+use std::mem;
+
+// Define ICMPv6 protocol number since it's not in winapi
+#[cfg(windows)]
+const IPPROTO_ICMPV6: i32 = 58;
 
 // Cross-platform network interface representation
 #[derive(Clone)]
@@ -201,17 +208,17 @@ fn get_network_interfaces() -> Vec<AppNetworkInterface> {
             let buffer = vec![0u8; size as usize];
             adapter_info = buffer.as_ptr() as *mut IP_ADAPTER_INFO;
             
-            if GetAdaptersInfo(Some(adapter_info), &mut size) == NO_ERROR {
+            if GetAdaptersInfo(Some(adapter_info), &mut size) == 0 {
                 let mut current = adapter_info;
                 
                 while !current.is_null() {
                     let adapter = &*current;
                     
-                    let name = std::ffi::CStr::from_ptr(adapter.AdapterName.as_ptr())
+                    let name = std::ffi::CStr::from_ptr(adapter.AdapterName.as_ptr() as *const i8)
                         .to_string_lossy()
                         .to_string();
                     
-                    let description = std::ffi::CStr::from_ptr(adapter.Description.as_ptr())
+                    let description = std::ffi::CStr::from_ptr(adapter.Description.as_ptr() as *const i8)
                         .to_string_lossy()
                         .to_string();
                     
@@ -226,7 +233,7 @@ fn get_network_interfaces() -> Vec<AppNetworkInterface> {
                     let mut ips = Vec::new();
                     let mut ip_list = &adapter.IpAddressList;
                     loop {
-                        let ip_str = std::ffi::CStr::from_ptr(ip_list.IpAddress.String.as_ptr())
+                        let ip_str = std::ffi::CStr::from_ptr(ip_list.IpAddress.String.as_ptr() as *const i8)
                             .to_string_lossy()
                             .to_string();
                         if !ip_str.is_empty() && ip_str != "0.0.0.0" {
@@ -337,32 +344,77 @@ fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::er
 
 #[cfg(windows)]
 fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::error::Error>> {
-    // Create raw ICMPv6 socket
-    let socket = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::ICMPV6))?;
-    
-    // Create Router Solicitation packet (ICMPv6)
-    let mut packet = [0u8; 8];
-    packet[0] = 133; // ICMPv6 Router Solicitation type
-    packet[1] = 0;   // Code
-    // Checksum will be calculated by the kernel
-    packet[2] = 0;
-    packet[3] = 0;
-    // Reserved field
-    packet[4] = 0;
-    packet[5] = 0;
-    packet[6] = 0;
-    packet[7] = 0;
+    unsafe {
+        // Initialize Winsock
+        let mut wsa_data: WSADATA = mem::zeroed();
+        let result = WSAStartup(0x0202, &mut wsa_data);
+        if result != 0 {
+            return Err(format!("WSAStartup failed: {}", result).into());
+        }
 
-    // Destination: all routers multicast (ff02::2)
-    let dest_addr = SocketAddrV6::new(
-        Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2),
-        0,
-        0,
-        interface.index,
-    );
+        // Create raw ICMPv6 socket
+        let socket = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+        if socket == INVALID_SOCKET {
+            WSACleanup();
+            return Err("Failed to create raw socket".into());
+        }
 
-    // Send the packet
-    socket.send_to(&packet, &dest_addr.into())?;
+        // Create Router Solicitation packet (ICMPv6)
+        #[repr(C, packed)]
+        struct Icmpv6RouterSolicitation {
+            icmp_type: u8,     // 133
+            icmp_code: u8,     // 0
+            icmp_checksum: u16, // Will be calculated by kernel
+            reserved: u32,     // Must be 0
+        }
+
+        let rs_packet = Icmpv6RouterSolicitation {
+            icmp_type: 133,    // Router Solicitation
+            icmp_code: 0,
+            icmp_checksum: 0,  // Kernel will calculate
+            reserved: 0,
+        };
+
+        // Destination address: ff02::2 (All Routers multicast)
+        let mut dest_addr: SOCKADDR_IN6 = mem::zeroed();
+        dest_addr.sin6_family = AF_INET6 as u16;
+        dest_addr.sin6_port = 0;
+        dest_addr.sin6_flowinfo = 0;
+        
+        // Set IPv6 address to ff02::2 by directly writing to the address bytes
+        // Use transmute to access the raw bytes of the address
+        let addr_ptr = &mut dest_addr.sin6_addr as *mut _ as *mut [u8; 16];
+        (*addr_ptr)[0] = 0xff;
+        (*addr_ptr)[1] = 0x02;
+        (*addr_ptr)[15] = 0x02;
+        
+        // Set scope ID for interface binding - accessing through the union
+        let scope_ptr = &mut dest_addr.u as *mut _ as *mut u32;
+        *scope_ptr = interface.index;
+
+        // Send the packet
+        let packet_bytes = std::slice::from_raw_parts(
+            &rs_packet as *const _ as *const u8,
+            mem::size_of::<Icmpv6RouterSolicitation>()
+        );
+
+        let result = sendto(
+            socket,
+            packet_bytes.as_ptr() as *const i8,
+            packet_bytes.len() as i32,
+            0,
+            &dest_addr as *const _ as *const SOCKADDR,
+            mem::size_of::<SOCKADDR_IN6>() as i32,
+        );
+
+        closesocket(socket);
+        WSACleanup();
+
+        if result == SOCKET_ERROR {
+            let error = WSAGetLastError();
+            return Err(format!("Failed to send packet, error: {}", error).into());
+        }
+    }
     
     Ok(())
 }
