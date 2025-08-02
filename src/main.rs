@@ -75,6 +75,21 @@ impl RouterSolicitationApp {
         }
     }
 
+    fn refresh_interfaces(&mut self) {
+        self.interfaces = get_network_interfaces()
+            .into_iter()
+            .filter(|iface| !iface.is_loopback && iface.is_up)
+            .collect();
+        
+        // Reset selection if the previously selected interface is no longer available
+        if let Some(selected_idx) = self.selected_interface {
+            if selected_idx >= self.interfaces.len() {
+                self.selected_interface = None;
+                self.status_message = "Interface list updated - please reselect interface".to_string();
+            }
+        }
+    }
+
     fn send_router_solicitation(&mut self) {
         if let Some(index) = self.selected_interface {
             if let Some(interface) = self.interfaces.get(index) {
@@ -119,6 +134,10 @@ impl eframe::App for RouterSolicitationApp {
 
             ui.horizontal(|ui| {
                 ui.label("Network Interface:");
+                
+                if ui.small_button("🔄").on_hover_text("Refresh interface list").clicked() {
+                    self.refresh_interfaces();
+                }
                 
                 let selected_text = if let Some(index) = self.selected_interface {
                     if let Some(interface) = self.interfaces.get(index) {
