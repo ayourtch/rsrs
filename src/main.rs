@@ -22,7 +22,7 @@ use windows::Win32::NetworkManagement::IpHelper::*;
 #[cfg(windows)]
 use winapi::um::winsock2::{
     WSAStartup, WSACleanup, WSAGetLastError, WSADATA, INVALID_SOCKET, SOCKET_ERROR,
-    socket, sendto, closesocket, setsockopt, SOL_SOCKET
+    socket, sendto, closesocket, setsockopt, bind
 };
 #[cfg(windows)]
 use winapi::shared::ws2def::{SOCK_RAW, AF_INET6, SOCKADDR};
@@ -31,13 +31,9 @@ use winapi::shared::ws2ipdef::SOCKADDR_IN6;
 #[cfg(windows)]
 use std::mem;
 
-// Define protocol numbers
+// Define protocol number
 #[cfg(windows)]
-const IPPROTO_RAW: i32 = 255;  // Raw IP packets
-#[cfg(windows)]
-const IPPROTO_ICMPV6: u8 = 58;
-#[cfg(windows)]
-const IPV6_HDRINCL: i32 = 2;
+const IPPROTO_ICMPV6: i32 = 58;
 
 // Cross-platform network interface representation
 #[derive(Clone)]
@@ -356,87 +352,50 @@ fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::er
             return Err(format!("WSAStartup failed: {}", result).into());
         }
 
-        // Create raw socket with IPPROTO_RAW to prevent double headers
-        let socket = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW);
+        // Create raw ICMPv6 socket (back to the working approach)
+        let socket = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
         if socket == INVALID_SOCKET {
             WSACleanup();
             return Err("Failed to create raw socket".into());
         }
 
-        // Enable IP header inclusion to prevent automatic header addition
-        let hdrincl: i32 = 1;
-        let result = setsockopt(
+        // Try to bind to unspecified address to influence source selection
+        let mut bind_addr: SOCKADDR_IN6 = mem::zeroed();
+        bind_addr.sin6_family = AF_INET6 as u16;
+        bind_addr.sin6_port = 0;
+        bind_addr.sin6_flowinfo = 0;
+        // Leave sin6_addr as all zeros (unspecified address)
+        let scope_ptr = &mut bind_addr.u as *mut _ as *mut u32;
+        *scope_ptr = interface.index;
+
+        let bind_result = bind(
             socket,
-            41, // IPPROTO_IPV6
-            IPV6_HDRINCL,
-            &hdrincl as *const _ as *const i8,
-            mem::size_of::<i32>() as i32,
+            &bind_addr as *const _ as *const SOCKADDR,
+            mem::size_of::<SOCKADDR_IN6>() as i32,
         );
-        if result != 0 {
-            closesocket(socket);
-            WSACleanup();
-            return Err("Failed to set IPV6_HDRINCL".into());
+
+        // Continue even if bind fails - it might not be supported
+        if bind_result != 0 {
+            // Binding failed, but continue anyway
         }
 
-        // Create the complete IPv6 + ICMPv6 packet
-        #[repr(C, packed)]
-        struct Ipv6Header {
-            version_class_label: u32, // Version(4) + Traffic Class(8) + Flow Label(20)
-            payload_length: u16,
-            next_header: u8,
-            hop_limit: u8,
-            source_addr: [u8; 16],
-            dest_addr: [u8; 16],
-        }
-
+        // Create Router Solicitation packet (ICMPv6 only)
         #[repr(C, packed)]
         struct Icmpv6RouterSolicitation {
             icmp_type: u8,     // 133
             icmp_code: u8,     // 0
-            icmp_checksum: u16, // Will be calculated
+            icmp_checksum: u16, // Will be calculated by kernel
             reserved: u32,     // Must be 0
         }
 
-        #[repr(C, packed)]
-        struct Ipv6Packet {
-            ipv6_header: Ipv6Header,
-            icmpv6_data: Icmpv6RouterSolicitation,
-        }
-
-        // Create IPv6 header
-        let ipv6_header = Ipv6Header {
-            version_class_label: (6u32 << 28).to_be(), // Version 6, Traffic Class 0, Flow Label 0
-            payload_length: (mem::size_of::<Icmpv6RouterSolicitation>() as u16).to_be(),
-            next_header: IPPROTO_ICMPV6,
-            hop_limit: 255,
-            source_addr: [0; 16], // Unspecified address (::)
-            dest_addr: [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02], // ff02::2
-        };
-
-        // Create ICMPv6 Router Solicitation
-        let mut icmpv6_data = Icmpv6RouterSolicitation {
+        let rs_packet = Icmpv6RouterSolicitation {
             icmp_type: 133,    // Router Solicitation
             icmp_code: 0,
-            icmp_checksum: 0,  // Will calculate below
+            icmp_checksum: 0,  // Kernel will calculate
             reserved: 0,
         };
 
-        // Calculate ICMPv6 checksum
-        let checksum = calculate_icmpv6_checksum(
-            &ipv6_header.source_addr,
-            &ipv6_header.dest_addr,
-            &icmpv6_data as *const _ as *const u8,
-            mem::size_of::<Icmpv6RouterSolicitation>()
-        );
-        icmpv6_data.icmp_checksum = checksum.to_be();
-
-        // Create complete packet
-        let packet = Ipv6Packet {
-            ipv6_header,
-            icmpv6_data,
-        };
-
-        // Destination address for sendto (just the IPv6 address part)
+        // Destination address: ff02::2 (All Routers multicast)
         let mut dest_addr: SOCKADDR_IN6 = mem::zeroed();
         dest_addr.sin6_family = AF_INET6 as u16;
         dest_addr.sin6_port = 0;
@@ -454,8 +413,8 @@ fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::er
 
         // Send the packet
         let packet_bytes = std::slice::from_raw_parts(
-            &packet as *const _ as *const u8,
-            mem::size_of::<Ipv6Packet>()
+            &rs_packet as *const _ as *const u8,
+            mem::size_of::<Icmpv6RouterSolicitation>()
         );
 
         let result = sendto(
@@ -477,50 +436,6 @@ fn send_rs_packet(interface: &AppNetworkInterface) -> Result<(), Box<dyn std::er
     }
     
     Ok(())
-}
-
-#[cfg(windows)]
-unsafe fn calculate_icmpv6_checksum(
-    src_addr: &[u8; 16],
-    dst_addr: &[u8; 16], 
-    icmp_data: *const u8,
-    icmp_len: usize
-) -> u16 {
-    let mut sum: u32 = 0;
-    
-    // Add source address
-    for i in (0..16).step_by(2) {
-        sum += ((src_addr[i] as u32) << 8) + (src_addr[i + 1] as u32);
-    }
-    
-    // Add destination address  
-    for i in (0..16).step_by(2) {
-        sum += ((dst_addr[i] as u32) << 8) + (dst_addr[i + 1] as u32);
-    }
-    
-    // Add upper-layer packet length
-    sum += icmp_len as u32;
-    
-    // Add next header (ICMPv6 = 58)
-    sum += IPPROTO_ICMPV6 as u32;
-    
-    // Add ICMPv6 header and data
-    let data_slice = std::slice::from_raw_parts(icmp_data, icmp_len);
-    for i in (0..icmp_len).step_by(2) {
-        if i + 1 < icmp_len {
-            sum += ((data_slice[i] as u32) << 8) + (data_slice[i + 1] as u32);
-        } else {
-            sum += (data_slice[i] as u32) << 8;
-        }
-    }
-    
-    // Fold to 16 bits
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    
-    // One's complement
-    (!sum) as u16
 }
 
 fn main() -> Result<(), eframe::Error> {
